@@ -7,6 +7,7 @@ import type {
   RequestStatus,
   Scene,
   StorageCondition,
+  UrgencyLevel,
 } from '@/types'
 import { daysUntil } from '@/utils/date'
 
@@ -89,6 +90,29 @@ export const CLOSE_MODE_LABELS = {
   mutual_aid: '邻里赠予，无需归还',
 } as const
 
+// ---- 夜间多人同时申请：紧急程度字典 ----
+export const URGENCY_LABELS: Record<UrgencyLevel, string> = {
+  critical: '紧急（持续高热 / 精神差等家属描述的最高紧急度）',
+  urgent: '较急（发热明显，需要尽快物理降温）',
+  normal: '一般（备着预防，暂无明显症状）',
+}
+
+export const URGENCY_SHORT: Record<UrgencyLevel, string> = {
+  critical: '紧急',
+  urgent: '较急',
+  normal: '一般',
+}
+
+/** 夜间时段：20:00 - 次日 06:00，触发多人同时申请分配建议 */
+export const NIGHT_START_HOUR = 20
+export const NIGHT_END_HOUR = 6
+
+export function isNightTime(iso: string | Date): boolean {
+  const d = iso instanceof Date ? iso : new Date(iso)
+  const h = d.getHours()
+  return h >= NIGHT_START_HOUR || h < NIGHT_END_HOUR
+}
+
 // ---- 业务规则参数 ----
 /** 效期预警阈值（天） */
 export const EXPIRY_WARN_DAYS = 60
@@ -97,6 +121,32 @@ export const EXPIRY_DANGER_DAYS = 30
 export const PICKUP_WINDOW_HOURS = 24
 /** 志愿者配送承诺时限（小时） */
 export const DELIVERY_SLA_HOURS = 6
+
+// ---- 夜间多人同时申请的分配评分参数（满分 100）----
+/** 紧急程度权重 */
+export const SCORE_URGENCY = 40
+/** 家中有儿童（夜间退热场景）权重 */
+export const SCORE_CHILD = 20
+/** 距离权重（越近分越高，最远按 DISTANCE_REF_METERS 线性递减到 0） */
+export const SCORE_DISTANCE = 20
+/** 库存数量匹配权重（申请数量不超过当前可分配量时给基础分，整盒需求另有说明） */
+export const SCORE_STOCK = 10
+/** 志愿者配送能力权重（仅在选择志愿者代送时参与；自取/门口交接不受限） */
+export const SCORE_CAPACITY = 10
+/** 距离评分的参考最远值（米）：超过即距离分为 0 */
+export const DISTANCE_REF_METERS = 1200
+/** 夜间一位志愿者可承接的代送单数 */
+export const NIGHT_DELIVERY_CAPACITY = 2
+/** 夜间多户同时申请的触发门槛：同一物品候补中申请数 ≥ 该值 */
+export const NIGHT_BATCH_MIN_APPLICANTS = 2
+/** 同一物品相邻两笔夜间申请视为“同时”的时间窗（小时） */
+export const NIGHT_BATCH_WINDOW_HOURS = 2
+
+export const URGENCY_SCORE: Record<UrgencyLevel, number> = {
+  critical: 40,
+  urgent: 26,
+  normal: 10,
+}
 
 export type ExpiryLevel = 'expired' | 'danger' | 'warn' | 'ok'
 

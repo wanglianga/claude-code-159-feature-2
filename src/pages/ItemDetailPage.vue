@@ -11,14 +11,18 @@ import {
   SCENE_HINTS,
   SCENE_LABELS,
   STORAGE_LABELS,
+  URGENCY_LABELS,
+  isNightTime,
 } from '@/rules'
 import { daysUntil } from '@/utils/date'
-import type { FeedbackType, HandoverMethod, Scene } from '@/types'
+import type { FeedbackType, HandoverMethod, Scene, UrgencyLevel } from '@/types'
 import SafetyBanner from '@/components/SafetyBanner.vue'
 import ExpiryBadge from '@/components/ExpiryBadge.vue'
 import ItemStatusBadge from '@/components/ItemStatusBadge.vue'
 import TimelineView from '@/components/TimelineView.vue'
 import RequestCard from '@/components/RequestCard.vue'
+import AllocationBatchPanel from '@/components/AllocationBatchPanel.vue'
+import HelpRecordCard from '@/components/HelpRecordCard.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -30,14 +34,32 @@ const available = computed(() => (item.value ? store.availableQty(item.value.id)
 const waiting = computed(() => (item.value ? store.waitingList(item.value.id) : []))
 const relatedRequests = computed(() => (item.value ? store.itemRequests(item.value.id) : []))
 const itemFeedback = computed(() => (item.value ? store.feedbacks.filter((f) => f.itemId === item.value!.id) : []))
+const batches = computed(() => (item.value ? store.batchesOfItem(item.value.id) : []))
+const helps = computed(() => (item.value ? store.helpRecordsOf({ itemId: item.value.id }) : []))
+/** 该物品的可替代用品（夜间未分到的家庭可改选） */
+const alternativeItems = computed(() => {
+  if (!item.value) return []
+  return store.items.filter(
+    (i) =>
+      i.id !== item.value!.id &&
+      ['published', 'partially_lent'].includes(i.status) &&
+      daysUntil(i.expiryDate, store.nowIso) >= 0 &&
+      store.availableQty(i.id) > 0 &&
+      (i.category === item.value!.category || (item.value!.category === 'fever_patch' && /冰袋|冷敷|降温/.test(i.name))),
+  )
+})
+const nightNow = computed(() => isNightTime(store.nowIso))
 
 // ---- 申请表单 ----
 const showApply = ref(false)
-const form = reactive<{ quantity: number; scene: Scene; method: HandoverMethod; note: string }>({
+const form = reactive<{ quantity: number; scene: Scene; method: HandoverMethod; note: string; urgency: UrgencyLevel; hasChild: boolean; symptom: string }>({
   quantity: 1,
   scene: 'child_night_fever',
   method: 'self_pickup',
   note: '',
+  urgency: 'normal',
+  hasChild: false,
+  symptom: '',
 })
 const agreed = reactive({ source: false, expiry: false, package: false, limit: false })
 const agreeAll = computed(() => agreed.source && agreed.expiry && agreed.package && agreed.limit)
@@ -49,6 +71,10 @@ function openApply() {
   if (!item.value) return
   form.quantity = Math.min(1, item.value.quantity) || 1
   form.scene = item.value.sceneTags[0] ?? 'home_care'
+  form.urgency = 'normal'
+  form.hasChild = false
+  form.symptom = ''
+  form.note = ''
   showApply.value = true
 }
 
@@ -58,7 +84,12 @@ function submitApply() {
     show('请先逐项确认来源、效期、包装状态与适用限制。', 'err')
     return
   }
-  const r = store.apply(item.value.id, form.quantity, form.scene, form.method, form.note || undefined)
+  const r = store.apply(item.value.id, form.quantity, form.scene, form.method, {
+    note: form.note || undefined,
+    urgency: form.urgency,
+    hasChild: form.hasChild,
+    symptom: form.symptom || undefined,
+  })
   show(r.message, r.ok ? 'ok' : 'err')
   if (r.ok) {
     showApply.value = false
@@ -139,7 +170,9 @@ function submitFeedback() {
       </div>
 
       <div class="card-actions" style="margin-top: 12px">
-        <button v-if="!blocked && !expired" class="btn btn-primary" @click="openApply">我要申请借用</button>
+        <button v-if="!blocked && !expired" class="btn btn-primary" @click="openApply">
+          我要申请借用<span v-if="nightNow">（🌙 夜间多人同时申请将按评分分配）</span>
+        </button>
         <button class="btn btn-danger btn-sm" @click="showFeedback = true">反馈包装破损 / 疑似不适</button>
       </div>
     </div>
@@ -154,6 +187,30 @@ function submitFeedback() {
         </select>
         <span class="hint">{{ SCENE_HINTS[form.scene] }}</span>
       </label>
+
+      <!-- 夜间多人同时申请分配所需信息 -->
+      <div v-if="form.scene === 'child_night_fever'" class="banner banner-info">
+        <strong>🌙 夜间多户同时申请时的分配说明</strong>
+        若多户家庭在夜间（20:00–次日06:00）两小时内同时申请同一物品，志愿者将按
+        <strong>紧急程度 → 家中是否有儿童 → 距离 → 库存数量 → 志愿者夜间配送能力</strong>
+        综合评分给出分配建议；评分与每户的分配理由都会留痕，社区端可查、可答复质疑。
+        未分到的家庭会<strong>自动保留求助记录</strong>，可转相邻小区互助、改选替代用品、收到就医提示，库存到货后还会按记录补发。
+      </div>
+      <label v-if="form.scene === 'child_night_fever'" class="field">
+        <span>当前紧急程度（家属自报，志愿者会电话核实；社区不做诊断）</span>
+        <select v-model="form.urgency">
+          <option v-for="[k, v] in Object.entries(URGENCY_LABELS)" :key="k" :value="k">{{ v }}</option>
+        </select>
+      </label>
+      <label v-if="form.scene === 'child_night_fever'" class="check-row">
+        <input type="checkbox" v-model="form.hasChild" />
+        家中有 14 岁以下儿童（夜间退热用品分配时作为优先因子）
+      </label>
+      <label v-if="form.scene === 'child_night_fever'" class="field">
+        <span>孩子当前情况（可选，仅用于志愿者核实与排序，不作为诊断依据）</span>
+        <textarea v-model="form.symptom" placeholder="如：39.2℃、精神差、有无抽搐史等；如持续高热/精神差/呼吸异常请直接就医"></textarea>
+      </label>
+
       <label class="field">
         <span>借用数量（当前可借 {{ available }}）</span>
         <input v-model.number="form.quantity" type="number" min="1" :max="item.quantity" />
@@ -162,8 +219,8 @@ function submitFeedback() {
         <span>交接方式</span>
         <select v-model="form.method">
           <option value="self_pickup">{{ METHOD_LABELS.self_pickup }}：自行到 {{ item.location }} 取</option>
-          <option value="volunteer_delivery">{{ METHOD_LABELS.volunteer_delivery }}：志愿者按约定时限代送</option>
-          <option value="door_contactless">{{ METHOD_LABELS.door_contactless }}：放到约定门口位置</option>
+          <option value="volunteer_delivery">{{ METHOD_LABELS.volunteer_delivery }}：志愿者按约定时限代送（夜间名额有限）</option>
+          <option value="door_contactless">{{ METHOD_LABELS.door_contactless }}：放到约定门口位置（不占代送名额）</option>
         </select>
       </label>
       <label class="field">
@@ -213,6 +270,20 @@ function submitFeedback() {
       <RequestCard v-for="r in relatedRequests" :key="r.id" :req="r" :item-name="item.name" />
     </template>
     <div v-else class="empty">暂无借用记录</div>
+
+    <!-- 夜间多人同时申请的分配批次与理由 -->
+    <template v-if="batches.length">
+      <h3 class="section-title">🌙 夜间多人同时申请分配记录（评分理由全程留痕）</h3>
+      <div v-for="b in batches" :key="b.id" class="card">
+        <AllocationBatchPanel :batch="b" detailed />
+      </div>
+    </template>
+
+    <!-- 未分到物品居民的求助记录（补发/互助/替代/质疑） -->
+    <template v-if="helps.length">
+      <h3 class="section-title">🆘 未分到物品居民的求助记录（持续保留，到货可补发）</h3>
+      <HelpRecordCard v-for="h in helps" :key="h.id" :help="h" :mode="store.isStaff ? 'staff' : store.isVolunteer ? 'volunteer' : 'resident'" :alternatives="alternativeItems" />
+    </template>
 
     <!-- 反馈记录 -->
     <template v-if="itemFeedback.length">

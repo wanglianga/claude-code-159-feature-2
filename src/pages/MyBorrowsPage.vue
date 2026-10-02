@@ -8,6 +8,7 @@ import SafetyBanner from '@/components/SafetyBanner.vue'
 import RequestCard from '@/components/RequestCard.vue'
 import PhotoCapture from '@/components/PhotoCapture.vue'
 import ExpiryBadge from '@/components/ExpiryBadge.vue'
+import HelpRecordCard from '@/components/HelpRecordCard.vue'
 import { hoursSince } from '@/utils/date'
 import type { BorrowRequest } from '@/types'
 
@@ -16,6 +17,8 @@ const router = useRouter()
 const { show } = useFlash()
 
 const myRequests = computed(() => store.requests.filter((r) => r.applicantId === store.currentUserId))
+/** 夜间未分到物品时为我保留的求助记录（含互助/替代/就医/补发全过程与质疑答复） */
+const myHelps = computed(() => store.helpRecordsOf({ applicantId: store.currentUserId }))
 const photos = ref<Record<string, string>>({})
 const closeMode = ref<Record<string, BorrowRequest['closeMode']>>({})
 
@@ -54,6 +57,12 @@ function closeBorrow(id: string) {
       申请、候补、交接拍照、归还/补充约定都在这里。请在确认后 {{ PICKUP_WINDOW_HOURS }} 小时内取走；志愿者配送承诺 {{ DELIVERY_SLA_HOURS }} 小时内送达。
     </div>
   </div>
+
+  <!-- 夜间未分到物品时为我保留的求助记录 -->
+  <template v-if="myHelps.length">
+    <h3 class="section-title">🆘 我的夜间求助记录（未分到也不会丢，到货会按记录补发）</h3>
+    <HelpRecordCard v-for="h in myHelps" :key="h.id" :help="h" mode="resident" />
+  </template>
 
   <div v-if="!myRequests.length" class="card empty">
     你还没有借用记录。<RouterLink to="/hall">去药箱大厅看看邻居分享了什么 →</RouterLink>
