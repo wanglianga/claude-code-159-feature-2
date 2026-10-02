@@ -1,0 +1,8 @@
+services:
+  medkit-web:
+    build: .
+    image: community-medkit-share:latest
+    container_name: community-medkit-share
+    ports:
+      - "8080:80"
+    restart: unless-stopped

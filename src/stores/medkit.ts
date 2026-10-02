@@ -1,6 +1,9 @@
 import { defineStore } from 'pinia'
 import { computed, reactive, ref } from 'vue'
 import type {
+  AidRoute,
+  AllocationQuestion,
+  AllocationRound,
   BorrowRequest,
   Feedback,
   FeedbackType,
@@ -10,12 +13,30 @@ import type {
   RequestStatus,
   Scene,
   TimelineEvent,
+  UrgencyLevel,
 } from '@/types'
-import { DELIVERY_SLA_HOURS, PICKUP_WINDOW_HOURS, STOCK_LOCKING_STATUSES, validateDraft } from '@/rules'
+import {
+  AID_ROUTE_HINTS,
+  DELIVERY_SLA_HOURS,
+  PICKUP_WINDOW_HOURS,
+  STOCK_LOCKING_STATUSES,
+  buildAllocationRoundDraft,
+  planAllocation,
+  suggestedAidRoute,
+  validateDraft,
+} from '@/rules'
 import { addHours, daysUntil, hoursSince } from '@/utils/date'
-import { BASE_NOW, DEMO_USERS, freshState, uid } from '@/data/seed'
+import { BASE_NOW, DEMO_USERS, NEIGHBOR_AID_POINTS, freshState, uid } from '@/data/seed'
 
-const STORAGE_KEY = 'medkit-share-state-v1'
+const STORAGE_KEY = 'medkit-share-state-v2'
+
+export interface ApplyFactors {
+  urgency: UrgencyLevel
+  hasChild: boolean
+  childAge?: number
+  temperature?: number
+  distanceMeters?: number
+}
 
 interface PersistShape {
   nowIso: string
@@ -24,6 +45,8 @@ interface PersistShape {
   requests: BorrowRequest[]
   feedbacks: Feedback[]
   timeline: TimelineEvent[]
+  allocations: AllocationRound[]
+  questions: AllocationQuestion[]
 }
 
 interface ActionResult {
@@ -39,6 +62,8 @@ function load(): PersistShape | null {
     if (!raw) return null
     const data = JSON.parse(raw) as PersistShape
     if (!Array.isArray(data.items) || !Array.isArray(data.requests)) return null
+    // v1 旧数据没有夜间分配集合，直接作废重建，避免半结构状态
+    if (!Array.isArray(data.allocations) || !Array.isArray(data.questions)) return null
     return data
   } catch {
     return null
@@ -55,6 +80,8 @@ export const useMedkitStore = defineStore('medkit', () => {
   const requests = ref<BorrowRequest[]>(seed.requests)
   const feedbacks = ref<Feedback[]>(seed.feedbacks)
   const timeline = ref<TimelineEvent[]>(seed.timeline)
+  const allocations = ref<AllocationRound[]>(seed.allocations ?? [])
+  const questions = ref<AllocationQuestion[]>(seed.questions ?? [])
 
   function persist() {
     const data: PersistShape = {
@@ -64,6 +91,8 @@ export const useMedkitStore = defineStore('medkit', () => {
       requests: requests.value,
       feedbacks: feedbacks.value,
       timeline: timeline.value,
+      allocations: allocations.value,
+      questions: questions.value,
     }
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
   }
@@ -83,6 +112,8 @@ export const useMedkitStore = defineStore('medkit', () => {
     requests.value = f.requests
     feedbacks.value = f.feedbacks
     timeline.value = f.timeline
+    allocations.value = f.allocations
+    questions.value = f.questions
     nowIso.value = BASE_NOW
     currentUserId.value = 'u_b'
     persist()
@@ -96,6 +127,13 @@ export const useMedkitStore = defineStore('medkit', () => {
   const currentUser = computed(() => DEMO_USERS.find((u) => u.id === currentUserId.value) ?? DEMO_USERS[0])
   const isVolunteer = computed(() => currentUser.value.role === 'volunteer' || currentUser.value.role === 'staff')
   const isStaff = computed(() => currentUser.value.role === 'staff')
+
+  /** 今晚在岗志愿者的总配送运力（总单数 − 已承担的未完成配送单） */
+  const volunteerCapacity = computed(() => {
+    const total = DEMO_USERS.filter((u) => u.role === 'volunteer' && u.onDuty).reduce((s, u) => s + (u.deliveryCapacity ?? 1), 0)
+    const used = new Set(requests.value.filter((r) => ['confirmed', 'handing'].includes(r.status) && r.method === 'volunteer_delivery' && r.volunteerId).map((r) => r.volunteerId)).size
+    return Math.max(0, total - used)
+  })
 
   // ---- 库存与状态派生 ----
   const itemsById = computed(() => new Map(items.value.map((i) => [i.id, i])))
@@ -211,7 +249,14 @@ export const useMedkitStore = defineStore('medkit', () => {
   }
 
   // ---- 居民：申请借用 ----
-  function apply(itemId: string, quantity: number, scene: Scene, method: HandoverMethod, note?: string): ActionResult {
+  function apply(
+    itemId: string,
+    quantity: number,
+    scene: Scene,
+    method: HandoverMethod,
+    note?: string,
+    factors?: ApplyFactors,
+  ): ActionResult {
     const it = requireItem(itemId)
     if (!['published', 'partially_lent', 'lent_out'].includes(it.status)) return { ok: false, message: '该物品当前不可申请。' }
     if (daysUntil(it.expiryDate, nowIso.value) < 0) {
@@ -220,6 +265,12 @@ export const useMedkitStore = defineStore('medkit', () => {
     if (quantity <= 0) return { ok: false, message: '借用数量需大于 0。' }
     const avail = availableQty(itemId)
     if (quantity > it.quantity) return { ok: false, message: '申请数量超过登记总量。' }
+    if (factors?.temperature != null && (factors.temperature < 35 || factors.temperature > 43)) {
+      return { ok: false, message: '体温数值异常（35–43℃），请核对后再提交。' }
+    }
+    if (factors?.distanceMeters != null && (factors.distanceMeters < 0 || factors.distanceMeters > 20000)) {
+      return { ok: false, message: '距离数值异常（0–20000 米），请核对后再提交。' }
+    }
 
     const req: BorrowRequest = reactive({
       id: uid('r'),
@@ -232,6 +283,12 @@ export const useMedkitStore = defineStore('medkit', () => {
       note,
       status: 'waiting',
       createdAt: nowIso.value,
+      address: currentUser.value.address,
+      urgency: factors?.urgency ?? 'spare',
+      hasChild: factors?.hasChild ?? false,
+      childAge: factors?.childAge,
+      temperature: factors?.temperature,
+      distanceMeters: factors?.distanceMeters,
     })
     requests.value.unshift(req)
     const ahead = waitingList(itemId).length - 1
@@ -278,6 +335,224 @@ export const useMedkitStore = defineStore('medkit', () => {
     addEvent({ itemId: r.itemId, requestId: r.id, at: nowIso.value, actorId: currentUserId.value, actorName: currentUser.value.name, kind: 'confirmed', detail: `确认申请并锁定库存 ×${r.quantity}，${PICKUP_WINDOW_HOURS}小时内需完成交接` })
     persist()
     return { ok: true, message: '已确认并锁定库存，请尽快安排交接。' }
+  }
+
+  // ---- 夜间多人争抢：分配建议 / 执行 / 出路 / 补发 / 质疑 ----
+
+  /** 分配预览（不落库）：页面给居民与志愿者实时展示排序建议 */
+  function previewAllocationPlan(itemId: string) {
+    const candidates = requests.value
+      .filter((r) => r.itemId === itemId && r.status === 'waiting')
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1))
+    return planAllocation({ requests: candidates, availableQty: availableQty(itemId), volunteerCapacity: volunteerCapacity.value })
+  }
+
+  /** 参与夜间分配的候选申请数（候补中 ≥2 户且库存不够全部分时才有争抢场景） */
+  function allocationContention(itemId: string): { applicants: number; demand: number; available: number } {
+    const candidates = requests.value.filter((r) => r.itemId === itemId && r.status === 'waiting')
+    return {
+      applicants: candidates.length,
+      demand: candidates.reduce((s, r) => s + r.quantity, 0),
+      available: availableQty(itemId),
+    }
+  }
+
+  /**
+   * 执行一轮夜间分配：评分排序 → 按库存锁定建议分到的申请；
+   * 未分到的申请取消但保留求助记录（helpStatus=open），居民随后选择三条出路。
+   */
+  function executeAllocation(itemId: string): ActionResult & { roundId?: string } {
+    if (!isVolunteer.value) return { ok: false, message: '夜间分配由在岗志愿者/社区工作人员执行。' }
+    const it = requireItem(itemId)
+    const candidates = requests.value
+      .filter((r) => r.itemId === itemId && r.status === 'waiting')
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1))
+    if (candidates.length < 2) return { ok: false, message: '至少要有 2 户同时候补时才需要启动分配规则。' }
+
+    const plan = planAllocation({ requests: candidates, availableQty: availableQty(itemId), volunteerCapacity: volunteerCapacity.value })
+    const round: AllocationRound = reactive({
+      id: uid('alloc'),
+      ...buildAllocationRoundDraft(it.id, it.name, plan),
+      createdAt: nowIso.value,
+      createdBy: currentUserId.value,
+      createdByName: currentUser.value.name,
+      status: 'adopted',
+      adoptedAt: nowIso.value,
+    })
+    allocations.value.unshift(round)
+
+    for (const scored of plan.ranked) {
+      const r = scored.req
+      r.score = scored.score
+      r.scoreDetails = scored.details
+      r.allocationId = round.id
+    }
+
+    // 分到：逐单锁定库存（整盒切分，余量不足的单子已在 plan 中跳过）
+    for (const rid of plan.allocatedRequestIds) {
+      const r = requests.value.find((x) => x.id === rid)!
+      r.allocated = true
+      r.status = 'confirmed'
+      r.confirmedAt = nowIso.value
+      r.confirmerId = currentUserId.value
+      r.confirmerName = currentUser.value.name
+      if (r.method === 'volunteer_delivery') {
+        r.volunteerId = currentUser.value.id
+        r.volunteerName = currentUser.value.name
+      }
+      addEvent({ itemId, requestId: r.id, at: nowIso.value, actorId: currentUserId.value, actorName: currentUser.value.name, kind: 'confirmed', detail: `夜间分配执行：${r.applicantName} 综合评分 ${r.score} 分最高，按建议锁定库存 ×${r.quantity}` })
+    }
+
+    // 未分到：申请取消但求助记录保留，等待居民选择出路/到货补发
+    for (const rid of plan.unallocatedRequestIds) {
+      const r = requests.value.find((x) => x.id === rid)!
+      r.allocated = false
+      r.status = 'cancelled'
+      r.closedAt = nowIso.value
+      r.helpStatus = 'open'
+      r.cancelReason = `夜间分配未分到：库存仅 ${plan.availableQty} 盒，综合评分 ${r.score} 分排序靠后；求助记录已保留，可转相邻小区互助/选择替代用品/收到就医提示，到货后可补发`
+      addEvent({ itemId, requestId: r.id, at: nowIso.value, actorId: 'system', actorName: '系统', kind: 'cancelled', detail: `夜间分配未分给 ${r.applicantName}（评分 ${r.score}），库存保留给更高优先级，求助记录保留` })
+    }
+
+    refreshItemStatus(itemId)
+    addEvent({
+      itemId,
+      at: nowIso.value,
+      actorId: currentUserId.value,
+      actorName: currentUser.value.name,
+      kind: 'allocation_adopted',
+      detail: `夜间分配已执行（${round.ruleVersion}）：${plan.allocatedRequestIds.length} 户分到、${plan.unallocatedRequestIds.length} 户未分到并保留求助记录；分配理由已存档供社区答复质疑`,
+    })
+    persist()
+    return {
+      ok: true,
+      roundId: round.id,
+      message: `分配已执行：${plan.allocatedRequestIds.length} 户分到物品，${plan.unallocatedRequestIds.length} 户未分到并保留求助记录，理由已存档。`,
+    }
+  }
+
+  /** 未分到物品的居民选择出路：相邻小区互助 / 替代用品 / 就医提示 */
+  function chooseAid(requestId: string, route: AidRoute, extra?: { neighborName?: string }): ActionResult {
+    const r = requests.value.find((x) => x.id === requestId)
+    if (!r) return { ok: false, message: '申请不存在。' }
+    if (r.applicantId !== currentUserId.value && !isVolunteer.value) return { ok: false, message: '只有申请人本人可以选择出路。' }
+    if (r.allocated !== false || r.helpStatus !== 'open') return { ok: false, message: '仅未分到物品且求助记录仍有效的申请可以选择出路。' }
+    r.aidChosen = route
+    r.aidChosenAt = nowIso.value
+    if (route === 'neighbor_community') {
+      r.aidNeighborName = extra?.neighborName ?? NEIGHBOR_AID_POINTS[0]
+    } else if (route === 'alternative') {
+      r.aidAlternative = '凉毛巾敷额头、温水擦拭颈部/腋下/腹股沟、减少捂盖、少量多次饮水并持续测温'
+    } else {
+      // 收到就医提示后诉求闭环，不再进入补发队列
+      r.helpStatus = 'closed'
+    }
+    addEvent({
+      itemId: r.itemId,
+      requestId: r.id,
+      at: nowIso.value,
+      actorId: currentUserId.value,
+      actorName: currentUser.value.name,
+      kind: 'aid_chosen',
+      detail:
+        route === 'neighbor_community'
+          ? `未分到物品，转入相邻小区互助：${r.aidNeighborName}`
+          : route === 'alternative'
+            ? `未分到物品，选择替代用品：${r.aidAlternative}`
+            : '未分到物品，已收到就医提示：持续高热/精神差请立即夜间急诊',
+    })
+    persist()
+    return { ok: true, message: AID_ROUTE_HINTS[route] }
+  }
+
+  /** 志愿者/工作人员登记新到货（同品类补货），到货后可为挂起的求助记录补发 */
+  function registerRestock(itemId: string, qty: number, note?: string): ActionResult {
+    if (!isVolunteer.value) return { ok: false, message: '只有志愿者/工作人员可以登记到货。' }
+    const it = requireItem(itemId)
+    if (!Number.isFinite(qty) || qty <= 0) return { ok: false, message: '到货数量需大于 0。' }
+    it.quantity += qty
+    // 借完/部分外借状态在有新余量时回到可借
+    if (it.status === 'lent_out' || it.status === 'partially_lent') it.status = 'published'
+    refreshItemStatus(itemId)
+    addEvent({ itemId, at: nowIso.value, actorId: currentUserId.value, actorName: currentUser.value.name, kind: 'restocked', detail: `夜间短缺后新到货 ×${qty}，可按求助记录补发${note ? `：${note}` : ''}` })
+    persist()
+    const open = helpRequests.value.filter((r) => r.itemId === itemId).length
+    return { ok: true, message: `已登记到货 ×${qty}。${open ? `当前有 ${open} 条未满足的求助记录可补发。` : '当前没有挂起的求助记录。'}` }
+  }
+
+  /** 根据库存到货，对未拿到物品的居民按求助记录补发（重新锁定并进入交接） */
+  function fulfillResupply(requestId: string, targetItemId?: string, note?: string): ActionResult {
+    if (!isVolunteer.value) return { ok: false, message: '只有志愿者/工作人员可以安排补发。' }
+    const r = requests.value.find((x) => x.id === requestId)
+    if (!r) return { ok: false, message: '求助记录不存在。' }
+    if (r.helpStatus !== 'open') return { ok: false, message: '该求助记录已补发或已关闭。' }
+    const targetId = targetItemId ?? r.itemId
+    if (!itemsById.value.has(targetId)) return { ok: false, message: '补发目标物品不存在。' }
+    if (availableQty(targetId) < r.quantity) return { ok: false, message: '到货余量仍不足，请先登记到货或改发其他同品类物品。' }
+
+    r.helpStatus = 'fulfilled'
+    r.fulfilledAt = nowIso.value
+    r.fulfilledBy = currentUser.value.name
+    r.fulfilledItemId = targetId
+    r.fulfilledNote = note
+    // 重新进入锁定/交接流程，沿用原申请的数量、方式与地址
+    r.status = 'confirmed'
+    r.confirmedAt = nowIso.value
+    r.confirmerId = currentUser.value.id
+    r.confirmerName = currentUser.value.name
+    r.cancelReason = undefined
+    if (r.method === 'volunteer_delivery') {
+      r.volunteerId = currentUser.value.id
+      r.volunteerName = currentUser.value.name
+    }
+    refreshItemStatus(targetId)
+    addEvent({ itemId: targetId, requestId: r.id, at: nowIso.value, actorId: currentUserId.value, actorName: currentUser.value.name, kind: 'help_fulfilled', detail: `按夜间求助记录到货补发给 ${r.applicantName} ×${r.quantity}${note ? `：${note}` : ''}` })
+    persist()
+    return { ok: true, message: `已按求助记录为 ${r.applicantName} 锁定补发 ×${r.quantity}，可继续安排交接。` }
+  }
+
+  /** 居民对某次分配提出质疑 */
+  function askAllocation(requestId: string, content: string): ActionResult {
+    const r = requests.value.find((x) => x.id === requestId)
+    if (!r || !r.allocationId) return { ok: false, message: '该申请没有对应的夜间分配记录。' }
+    if (r.applicantId !== currentUserId.value) return { ok: false, message: '只能对自己的分配结果提出质疑。' }
+    if (!content.trim()) return { ok: false, message: '请填写质疑内容。' }
+    const q: AllocationQuestion = reactive({
+      id: uid('q'),
+      allocationId: r.allocationId,
+      itemId: r.itemId,
+      requestId: r.id,
+      questionerId: currentUserId.value,
+      questionerName: currentUser.value.name,
+      content: content.trim(),
+      createdAt: nowIso.value,
+      status: 'open',
+    })
+    questions.value.unshift(q)
+    addEvent({ itemId: r.itemId, requestId: r.id, at: nowIso.value, actorId: currentUserId.value, actorName: currentUser.value.name, kind: 'question', detail: `对夜间分配提出质疑：${content}` })
+    persist()
+    return { ok: true, message: '质疑已提交，社区工作人员可在“分配理由与质疑”中逐项因子答复你。' }
+  }
+
+  /** 社区答复质疑（基于存档的评分理由） */
+  function replyQuestion(questionId: string, reply: string): ActionResult {
+    if (!isStaff.value) return { ok: false, message: '只有社区工作人员可以答复分配质疑。' }
+    const q = questions.value.find((x) => x.id === questionId)
+    if (!q || q.status !== 'open') return { ok: false, message: '质疑不存在或已答复。' }
+    if (!reply.trim()) return { ok: false, message: '请填写答复内容。' }
+    q.status = 'replied'
+    q.reply = reply.trim()
+    q.repliedAt = nowIso.value
+    q.replierName = currentUser.value.name
+    addEvent({ itemId: q.itemId, requestId: q.requestId, at: nowIso.value, actorId: currentUserId.value, actorName: currentUser.value.name, kind: 'question_replied', detail: `答复分配质疑：${reply}` })
+    persist()
+    return { ok: true, message: '已答复，居民可在“我的借用”看到逐项解释。' }
+  }
+
+  /** 系统对未选择出路的高热申请给出默认就医提示（供页面一键采用，规则同 chooseAid） */
+  function defaultAidRouteOf(requestId: string): AidRoute | undefined {
+    const r = requests.value.find((x) => x.id === requestId)
+    return r && r.allocated === false ? suggestedAidRoute(r) : undefined
   }
 
   // ---- 交接 ----
@@ -566,7 +841,53 @@ export const useMedkitStore = defineStore('medkit', () => {
       expired: expiredListed.value.length,
       quarantined: items.value.filter((i) => i.status === 'quarantined').length,
       scrapped: items.value.filter((i) => i.status === 'scrapped').length,
+      openHelp: helpRequests.value.filter((r) => r.helpStatus === 'open').length,
+      openQuestions: questions.value.filter((q) => q.status === 'open').length,
+      allocationRounds: allocations.value.length,
     }
+  })
+
+  // ---- 夜间分配相关派生数据 ----
+  /** 未拿到物品、被保留下来的求助记录（含已选出路与补发状态） */
+  const helpRequests = computed(() =>
+    requests.value
+      .filter((r) => r.helpStatus != null)
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1)),
+  )
+  /** 仍挂起、等待到货补发的求助记录（志愿者视角） */
+  const openHelpRequests = computed(() => helpRequests.value.filter((r) => r.helpStatus === 'open'))
+  const openQuestions = computed(() =>
+    questions.value
+      .filter((q) => q.status === 'open')
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1)),
+  )
+  function allocationsForItem(itemId: string): AllocationRound[] {
+    return allocations.value
+      .filter((a) => a.itemId === itemId)
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
+  }
+  function allocationOf(roundId: string): AllocationRound | undefined {
+    return allocations.value.find((a) => a.id === roundId)
+  }
+
+  /** 社区端夜间短缺复盘：按物品聚合真实未满足需求 */
+  const shortageReview = computed(() => {
+    const rows = helpRequests.value.map((r) => ({
+      req: r,
+      item: itemsById.value.get(r.itemId),
+      round: allocations.value.find((a) => a.id === r.allocationId),
+    }))
+    const byItem = new Map<string, { itemName: string; open: number; fulfilled: number; closed: number; total: number }>()
+    for (const row of rows) {
+      const key = row.req.itemId
+      const cur = byItem.get(key) ?? { itemName: row.item?.name ?? key, open: 0, fulfilled: 0, closed: 0, total: 0 }
+      cur.total += 1
+      if (row.req.helpStatus === 'open') cur.open += 1
+      else if (row.req.helpStatus === 'fulfilled') cur.fulfilled += 1
+      else cur.closed += 1
+      byItem.set(key, cur)
+    }
+    return { rows, byItem: [...byItem.values()] }
   })
 
   function itemTimeline(itemId: string): TimelineEvent[] {
@@ -585,10 +906,13 @@ export const useMedkitStore = defineStore('medkit', () => {
     requests,
     feedbacks,
     timeline,
+    allocations,
+    questions,
     // getters
     currentUser,
     isVolunteer,
     isStaff,
+    volunteerCapacity,
     reviewQueue,
     openFeedbackList,
     expiredListed,
@@ -596,6 +920,10 @@ export const useMedkitStore = defineStore('medkit', () => {
     overduePickups,
     delayedDeliveries,
     stats,
+    helpRequests,
+    openHelpRequests,
+    openQuestions,
+    shortageReview,
     // actions
     advanceHours,
     resetDemo,
@@ -622,5 +950,17 @@ export const useMedkitStore = defineStore('medkit', () => {
     scrapItem,
     itemTimeline,
     itemRequests,
+    // 夜间多人争抢分配
+    previewAllocationPlan,
+    allocationContention,
+    executeAllocation,
+    chooseAid,
+    registerRestock,
+    fulfillResupply,
+    askAllocation,
+    replyQuestion,
+    allocationsForItem,
+    allocationOf,
+    defaultAidRouteOf,
   }
 })

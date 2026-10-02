@@ -1,4 +1,7 @@
 import type {
+  AidRoute,
+  AllocationRound,
+  BorrowRequest,
   Category,
   FeedbackType,
   HandoverMethod,
@@ -6,7 +9,9 @@ import type {
   ItemStatus,
   RequestStatus,
   Scene,
+  ScoreBreakdown,
   StorageCondition,
+  UrgencyLevel,
 } from '@/types'
 import { daysUntil } from '@/utils/date'
 
@@ -81,6 +86,33 @@ export const FEEDBACK_TYPE_LABELS: Record<FeedbackType, string> = {
   package_damaged: '包装破损',
   adverse_reaction: '疑似使用后不适',
   other: '其他问题',
+}
+
+export const URGENCY_LABELS: Record<UrgencyLevel, string> = {
+  child_high_fever: '儿童高热（实测≥39℃ 或精神差）',
+  fever: '正在发烧，急需物理降温',
+  low_fever: '低热观察或刚发现发烧',
+  spare: '只是家庭备货，暂不急用',
+}
+
+/** 紧急程度基础分（最大因子） */
+export const URGENCY_POINTS: Record<UrgencyLevel, number> = {
+  child_high_fever: 50,
+  fever: 32,
+  low_fever: 14,
+  spare: 0,
+}
+
+export const AID_ROUTE_LABELS: Record<AidRoute, string> = {
+  neighbor_community: '转入相邻小区互助',
+  alternative: '选择替代用品先物理降温',
+  medical_advice: '收到就医提示（持续高热/精神差）',
+}
+
+export const AID_ROUTE_HINTS: Record<AidRoute, string> = {
+  neighbor_community: '已把你的夜间求助同步给相邻小区共享点，有库存的小区志愿者会接单代送。',
+  alternative: '建议先用凉毛巾敷额头、温水擦拭颈部/腋下/腹股沟、减少捂盖、少量多次饮水，并持续测温。',
+  medical_advice: '儿童高热不退、伴精神萎靡/抽搐/呼吸急促时，退热贴只是辅助，请立即前往医院夜间急诊。',
 }
 
 export const CLOSE_MODE_LABELS = {
@@ -181,3 +213,198 @@ export const STOCK_LOCKING_STATUSES: RequestStatus[] = ['confirmed', 'handing', 
 export function isTerminalItemStatus(status: ItemStatus): boolean {
   return status === 'rejected' || status === 'recalled' || status === 'scrapped'
 }
+
+// ===========================================================================
+// 夜间多人同时申请同一物品（如退热贴）的分配规则
+// 评分因子（全部可解释，社区端可逐项答复居民质疑）：
+//   1. 紧急程度 urgency      0 / 14 / 32 / 50 分
+//   2. 家中是否有儿童       有儿童 +20 分
+//   3. 距离（步行米数）      ≤200m +15 / ≤500m +10 / ≤1000m +5 / 更远 0
+//   4. 志愿者配送能力        需要代送且今晚仍有在岗运力 +10 分
+//   5. 申请先后（同分微调） 越早申请次序分越高，保证排序稳定可解释
+// 库存切分：按总分从高到低，逐单整盒锁定；剩余库存不足一单时跳过该单继续看后面，
+// 未分到的居民保留求助记录，并给出三条出路（相邻小区/替代用品/就医提示）。
+// ===========================================================================
+
+export const ALLOCATION_RULE_VERSION = 'night-allocation-v1'
+
+/** 有儿童加分 */
+export const CHILD_POINTS = 20
+/** 距离分档（米，含端点） */
+export const DISTANCE_TIERS: { maxMeters: number; points: number; label: string }[] = [
+  { maxMeters: 200, points: 15, label: '200 米以内' },
+  { maxMeters: 500, points: 10, label: '500 米以内' },
+  { maxMeters: 1000, points: 5, label: '1 公里以内' },
+]
+export const DISTANCE_FAR_POINTS = 0
+/** 志愿者夜间可配送时，代送申请的加分 */
+export const DELIVERY_POINTS = 10
+
+export function distancePointsOf(meters: number | undefined): { points: number; label: string } {
+  const m = meters ?? Number.POSITIVE_INFINITY
+  const hit = DISTANCE_TIERS.find((t) => m <= t.maxMeters)
+  return hit ? { points: hit.points, label: hit.label } : { points: DISTANCE_FAR_POINTS, label: '超过 1 公里' }
+}
+
+export interface ScoredRequest {
+  req: BorrowRequest
+  score: number
+  details: ScoreBreakdown
+}
+
+export interface AllocationPlan {
+  ranked: ScoredRequest[]
+  allocatedRequestIds: string[]
+  unallocatedRequestIds: string[]
+  /** 评分后实际使用的志愿者配送单数（不超过运力） */
+  deliveryUsed: number
+  volunteerCapacity: number
+  availableQty: number
+}
+
+/**
+ * 计算一单申请的评分明细。deliveryBonus 由 planAllocation 按今晚运力统一分配。
+ */
+export function scoreRequest(
+  req: BorrowRequest,
+  ctx: { orderIndex: number; total: number; deliveryBonus: boolean },
+): ScoredRequest {
+  const reasons: string[] = []
+
+  const urgencyPoints = URGENCY_POINTS[req.urgency ?? 'spare']
+  reasons.push(`紧急程度「${URGENCY_LABELS[req.urgency ?? 'spare']}」${urgencyPoints} 分`)
+
+  const childPoints = req.hasChild ? CHILD_POINTS : 0
+  reasons.push(
+    req.hasChild
+      ? `家中有儿童需使用（${req.childAge ? `${req.childAge} 岁，` : ''}${req.temperature ? `实测 ${req.temperature}℃，` : ''}更需优先）+${CHILD_POINTS} 分`
+      : '非儿童使用 +0 分',
+  )
+
+  const d = distancePointsOf(req.distanceMeters)
+  const distancePoints = d.points
+  reasons.push(
+    req.distanceMeters != null
+      ? `距取用点约 ${req.distanceMeters} 米（${d.label}，夜间取送更快）+${d.points} 分`
+      : `未填距离，按最远处理（${d.label}）+${d.points} 分`,
+  )
+
+  // 越早申请次序分越高（最多 0.9 分，只用于同分时稳定排序，不会改变主因子排序）
+  // orderIndex 由 planAllocation 按“申请时间先后”统一编号；直接调用时按入参给出。
+  const orderPoints = Number(Math.max(0, (ctx.total - 1 - ctx.orderIndex) * 0.1).toFixed(2))
+
+  const getsDeliveryBonus = ctx.deliveryBonus && req.method === 'volunteer_delivery'
+  const deliveryPoints = getsDeliveryBonus ? DELIVERY_POINTS : 0
+  if (req.method === 'volunteer_delivery') {
+    reasons.push(ctx.deliveryBonus ? `申请志愿者代送且今晚仍有配送运力 +${DELIVERY_POINTS} 分` : '申请志愿者代送，但今晚配送运力已排满 +0 分')
+  } else {
+    reasons.push('自取/门口交接，不占用夜间配送运力 +0 分')
+  }
+
+  const score = Number((urgencyPoints + childPoints + distancePoints + deliveryPoints + orderPoints).toFixed(2))
+  return {
+    req,
+    score,
+    details: { urgencyPoints, childPoints, distancePoints, deliveryPoints, orderPoints, reasons },
+  }
+}
+
+/**
+ * 夜间争抢分配：按因子评分排序，再按库存逐单切分。
+ * 志愿者运力只够前 N 个“代送”申请拿到配送加分，N 之后的代送申请转为 0 分并在理由中说明。
+ */
+export function planAllocation(input: {
+  requests: BorrowRequest[]
+  availableQty: number
+  volunteerCapacity: number
+}): AllocationPlan {
+  const { requests, availableQty, volunteerCapacity } = input
+  const total = requests.length
+
+  // 先按“不含配送分”的基础分排序，决定谁能占用今晚有限的配送运力
+  const baseRanked = requests
+    .map((req, orderIndex) => ({ req, base: scoreRequest(req, { orderIndex, total, deliveryBonus: false }) }))
+    .sort((a, b) => b.base.score - a.base.score || (a.req.createdAt < b.req.createdAt ? -1 : 1))
+
+  let deliveryLeft = Math.max(0, volunteerCapacity)
+  const deliveryBonusIds = new Set<string>()
+  for (const x of baseRanked) {
+    if (deliveryLeft <= 0) break
+    if (x.req.method === 'volunteer_delivery') {
+      deliveryBonusIds.add(x.req.id)
+      deliveryLeft -= 1
+    }
+  }
+  const deliveryUsed = Math.max(0, volunteerCapacity - deliveryLeft)
+
+  // 次序分只与“申请时间先后”有关，与输入数组顺序无关：越早申请编号越小
+  const byApplyTime = [...requests].sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0))
+  const orderByTime = new Map(byApplyTime.map((r, i) => [r.id, i]))
+  const ranked = requests
+    .map((req) => scoreRequest(req, { orderIndex: orderByTime.get(req.id) ?? 0, total, deliveryBonus: deliveryBonusIds.has(req.id) }))
+    .sort((a, b) => b.score - a.score || (a.req.createdAt < b.req.createdAt ? -1 : 1))
+
+  // 按库存逐单整盒切分；库存不足一单时跳过，继续尝试后面的申请
+  let stock = Math.max(0, availableQty)
+  const allocatedRequestIds: string[] = []
+  for (const x of ranked) {
+    if (stock >= x.req.quantity) {
+      allocatedRequestIds.push(x.req.id)
+      stock -= x.req.quantity
+    }
+  }
+  const allocatedSet = new Set(allocatedRequestIds)
+  const unallocatedRequestIds = ranked.filter((x) => !allocatedSet.has(x.req.id)).map((x) => x.req.id)
+
+  return { ranked, allocatedRequestIds, unallocatedRequestIds, deliveryUsed, volunteerCapacity, availableQty }
+}
+
+/** 把评分结果组织成社区端可直接展示/答复质疑的分配理由 */
+export function buildAllocationSummary(itemName: string, plan: AllocationPlan): string {
+  const lines: string[] = []
+  lines.push(
+    `本轮「${itemName}」可借库存 ${plan.availableQty} 盒，夜间在岗配送运力 ${plan.volunteerCapacity} 单（实际占用 ${plan.deliveryUsed} 单），共 ${plan.ranked.length} 户同时申请；按紧急程度→是否有儿童→距离→配送能力→申请先后评分：`,
+  )
+  plan.ranked.forEach((x, i) => {
+    const got = plan.allocatedRequestIds.includes(x.req.id)
+    const temp = x.req.temperature ? `，实测 ${x.req.temperature}℃` : ''
+    lines.push(
+      `${i + 1}. ${x.req.applicantName}（${x.req.address ?? '地址未填'}，${x.req.distanceMeters ?? '?'}m${temp}）总分 ${x.score}：${x.details.reasons.join('；')} → ${got ? `建议分配 ×${x.req.quantity}` : '库存不足，不予分配，保留求助记录并给出相邻小区/替代用品/就医提示'}`,
+    )
+  })
+  return lines.join('\n')
+}
+
+/** 组装一轮分配记录（不含 id/时间，由 store 补充） */
+export function buildAllocationRoundDraft(
+  itemId: string,
+  itemName: string,
+  plan: AllocationPlan,
+): Omit<AllocationRound, 'id' | 'createdAt' | 'createdBy' | 'createdByName'> {
+  return {
+    itemId,
+    requestIds: plan.ranked.map((x) => x.req.id),
+    allocatedRequestIds: plan.allocatedRequestIds,
+    unallocatedRequestIds: plan.unallocatedRequestIds,
+    availableQty: plan.availableQty,
+    volunteerCapacity: plan.volunteerCapacity,
+    status: 'suggested',
+    ruleVersion: ALLOCATION_RULE_VERSION,
+    summary: buildAllocationSummary(itemName, plan),
+  }
+}
+
+/** 未分到物品时，根据紧急程度给出默认出路建议（居民可自行改选） */
+export function suggestedAidRoute(req: BorrowRequest): AidRoute {
+  if (req.urgency === 'child_high_fever') return 'medical_advice'
+  if (req.urgency === 'spare') return 'alternative'
+  return 'neighbor_community'
+}
+
+/** 社区端夜间短缺复盘行：一个未满足求助 = 一条真实需求 */
+export interface ShortageRow {
+  req: BorrowRequest
+  itemName: string
+  round?: AllocationRound
+}
+

@@ -20,6 +20,13 @@ export type Scene =
 /** 存放条件 */
 export type StorageCondition = 'room_temp' | 'cool_dry' | 'refrigerate'
 
+/** 紧急程度（申请人在表单中自述，社区/志愿者可在物品页核实调整建议） */
+export type UrgencyLevel =
+  | 'child_high_fever' // 儿童高热（≥39℃）/伴精神差，最优先并同步就医提示
+  | 'fever' // 发烧中，急需物理降温
+  | 'low_fever' // 低热/预防备用
+  | 'spare' // 只是家中备货，不急
+
 /** 物品全流程状态 */
 export type ItemStatus =
   | 'pending_review' // 待审核
@@ -85,6 +92,40 @@ export interface BorrowRequest {
   note?: string
   status: RequestStatus
   createdAt: string
+  // ---- 夜间多人争抢分配因子（由申请人在表单中如实填写）----
+  /** 紧急程度自述 */
+  urgency?: UrgencyLevel
+  /** 家中是否有儿童需要使用（退热贴等品类的重要优先因子） */
+  hasChild?: boolean
+  /** 儿童年龄（岁），仅在 hasChild 时填写，用于核实 */
+  childAge?: number
+  /** 当前测得体温（℃，一位小数），选填，用于核实紧急程度 */
+  temperature?: number
+  /** 取用人住址（夜间配送距离计算依据） */
+  address?: string
+  /** 距取用点的步行距离（米），申请人填写或由位置估算 */
+  distanceMeters?: number
+  // ---- 分配建议（一次分配一轮，随申请持久化）----
+  allocationId?: string
+  /** 综合评分（越高越优先） */
+  score?: number
+  /** 评分明细，用于社区端向居民解释“为什么是这个顺序” */
+  scoreDetails?: ScoreBreakdown
+  /** 系统/志愿者是否按建议把库存分给了本申请 */
+  allocated?: boolean
+  // ---- 未分到物品后的三条出路 ----
+  aidChosen?: AidRoute
+  aidChosenAt?: string
+  /** 相邻小区互助：承接的小区/站点名 */
+  aidNeighborName?: string
+  /** 替代用品建议（如 凉毛巾/温水擦拭物理降温） */
+  aidAlternative?: string
+  /** 未拿到物品的求助记录状态（志愿者到货后可据此补发） */
+  helpStatus?: 'open' | 'fulfilled' | 'closed'
+  fulfilledAt?: string
+  fulfilledBy?: string // 志愿者/工作人员姓名
+  fulfilledItemId?: string // 补发时实际发出的物品（可能是新到货批次）
+  fulfilledNote?: string
   confirmedAt?: string
   handingAt?: string
   completedAt?: string
@@ -103,6 +144,64 @@ export interface BorrowRequest {
   /** 归还/补充方式 */
   closeMode?: 'return_sealed' | 'restock_new' | 'mutual_aid'
   closeNote?: string
+}
+
+/** 未分配到物品居民的三条出路 */
+export type AidRoute = 'neighbor_community' | 'alternative' | 'medical_advice'
+
+/** 评分因子明细（每一项都可解释，便于社区处理质疑） */
+export interface ScoreBreakdown {
+  urgencyPoints: number
+  childPoints: number
+  distancePoints: number
+  deliveryPoints: number
+  /** 同分时按申请先后的微小次序分，保证排序稳定可解释 */
+  orderPoints: number
+  /** 评分依据的人话说明（逐因子列出） */
+  reasons: string[]
+}
+
+/** 一次“多人同时申请同一物品”的分配轮次（夜间退热贴争抢场景） */
+export interface AllocationRound {
+  id: string
+  itemId: string
+  /** 参与本轮排序的申请 ID（按下达分配时的候补/新申请快照） */
+  requestIds: string[]
+  /** 建议分到的申请 ID（按评分 + 库存数量贪心切分） */
+  allocatedRequestIds: string[]
+  /** 未分到、保留求助记录的申请 ID */
+  unallocatedRequestIds: string[]
+  /** 参与排序时的可借库存快照 */
+  availableQty: number
+  /** 参与排序时在岗可配送志愿者数（配送能力因子依据） */
+  volunteerCapacity: number
+  createdAt: string
+  /** 谁执行了分配（志愿者/工作人员，或系统建议） */
+  createdBy: string
+  createdByName: string
+  /** 分配执行状态：suggested=仅给出建议；adopted=已按建议锁定库存 */
+  status: 'suggested' | 'adopted'
+  adoptedAt?: string
+  /** 分配规则版本，便于复盘口径一致 */
+  ruleVersion: string
+  /** 给社区端的整段分配理由（汇总每个申请人的因子与结论） */
+  summary: string
+}
+
+/** 居民对某次分配的质疑（社区端可见、可答复） */
+export interface AllocationQuestion {
+  id: string
+  allocationId: string
+  itemId: string
+  requestId: string
+  questionerId: string
+  questionerName: string
+  content: string
+  createdAt: string
+  status: 'open' | 'replied'
+  reply?: string
+  repliedAt?: string
+  replierName?: string
 }
 
 export interface Feedback {
@@ -127,6 +226,12 @@ export interface DemoUser {
   name: string
   role: 'resident' | 'volunteer' | 'staff'
   address: string
+  /** 所属小区（未分到物品时可转相邻小区互助） */
+  community?: string
+  /** 志愿者：今晚是否在岗可夜间配送 */
+  onDuty?: boolean
+  /** 志愿者：本轮还能承担的配送单数（配送能力） */
+  deliveryCapacity?: number
 }
 
 export interface TimelineEvent {
@@ -154,12 +259,11 @@ export interface TimelineEvent {
     | 'overdue_flagged'
     | 'delay_flagged'
     | 'cancelled'
+    | 'allocation_suggested'
+    | 'allocation_adopted'
+    | 'aid_chosen'
+    | 'help_fulfilled'
+    | 'question'
+    | 'question_replied'
   detail?: string
-}
-
-export interface DemoUser {
-  id: string
-  name: string
-  role: 'resident' | 'volunteer' | 'staff'
-  address: string
 }

@@ -23,6 +23,12 @@ const KIND_ICON: Record<TimelineEvent['kind'], string> = {
   overdue_flagged: '⏰',
   delay_flagged: '🐢',
   cancelled: '❌',
+  allocation_suggested: '🌙',
+  allocation_adopted: '🧮',
+  aid_chosen: '🤝',
+  help_fulfilled: '📦',
+  question: '❓',
+  question_replied: '💬',
 }
 
 const list = computed(() => [...props.events].sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0)))

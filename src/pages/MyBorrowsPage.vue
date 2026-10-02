@@ -3,13 +3,13 @@ import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useMedkitStore } from '@/stores/medkit'
 import { useFlash } from '@/composables/useFlash'
-import { CLOSE_MODE_LABELS, DELIVERY_SLA_HOURS, PICKUP_WINDOW_HOURS } from '@/rules'
+import { AID_ROUTE_HINTS, AID_ROUTE_LABELS, CLOSE_MODE_LABELS, DELIVERY_SLA_HOURS, PICKUP_WINDOW_HOURS } from '@/rules'
 import SafetyBanner from '@/components/SafetyBanner.vue'
 import RequestCard from '@/components/RequestCard.vue'
 import PhotoCapture from '@/components/PhotoCapture.vue'
 import ExpiryBadge from '@/components/ExpiryBadge.vue'
 import { hoursSince } from '@/utils/date'
-import type { BorrowRequest } from '@/types'
+import type { AidRoute, BorrowRequest } from '@/types'
 
 const store = useMedkitStore()
 const router = useRouter()
@@ -18,6 +18,7 @@ const { show } = useFlash()
 const myRequests = computed(() => store.requests.filter((r) => r.applicantId === store.currentUserId))
 const photos = ref<Record<string, string>>({})
 const closeMode = ref<Record<string, BorrowRequest['closeMode']>>({})
+const questionText = ref<Record<string, string>>({})
 
 function itemOf(id: string) {
   return store.items.find((i) => i.id === id)
@@ -43,6 +44,23 @@ function closeBorrow(id: string) {
   const r = store.closeBorrow(id, mode, mode === 'return_sealed' ? '原物未拆封归还至共享柜' : mode === 'restock_new' ? '已购买同规格新品补充' : '共享人同意赠予')
   show(r.message, r.ok ? 'ok' : 'err')
 }
+function chooseAid(id: string, route: AidRoute) {
+  const r = store.chooseAid(id, route)
+  show(r.message, r.ok ? 'ok' : 'err')
+}
+function askQuestion(id: string) {
+  const content = questionText.value[id]?.trim()
+  if (!content) {
+    show('请先填写质疑内容。', 'err')
+    return
+  }
+  const r = store.askAllocation(id, content)
+  show(r.message, r.ok ? 'ok' : 'err')
+  if (r.ok) questionText.value[id] = ''
+}
+function answerOf(id: string) {
+  return store.questions.find((q) => q.requestId === id && q.status === 'replied')
+}
 </script>
 
 <template>
@@ -61,6 +79,45 @@ function closeBorrow(id: string) {
 
   <div v-for="r in myRequests" :key="r.id" class="card">
     <RequestCard :req="r" :item-name="itemOf(r.itemId)?.name ?? r.itemId" />
+
+    <!-- 夜间分配未分到：求助记录保留 + 三条出路 -->
+    <template v-if="r.allocated === false">
+      <div class="banner banner-warn" style="margin-top: 8px">
+        <strong>🌙 本次夜间分配未分到物品，你的求助记录已保留。</strong>
+        综合评分 {{ r.score }} 分，库存不足；志愿者到货后会按记录补发，不会漏掉你。
+      </div>
+
+      <!-- 补发后重新进入待交接 -->
+      <div v-if="r.helpStatus === 'fulfilled'" class="banner banner-success" style="margin-top: 8px">
+        📦 已到货补发：{{ r.fulfilledAt?.replace('T', ' ').slice(0, 16) }} 由 {{ r.fulfilledBy }} 为你锁定 ×{{ r.quantity }}，请按下方流程完成交接。
+      </div>
+
+      <!-- 待补发：选择过渡出路 -->
+      <template v-else-if="r.helpStatus === 'open'">
+        <div class="muted" style="margin: 6px 0">等待到货期间，你可以先：</div>
+        <div class="card-actions">
+          <button class="btn btn-sm btn-primary" @click="chooseAid(r.id, 'neighbor_community')">{{ AID_ROUTE_LABELS.neighbor_community }}</button>
+          <button class="btn btn-sm" @click="chooseAid(r.id, 'alternative')">{{ AID_ROUTE_LABELS.alternative }}</button>
+          <button class="btn btn-sm btn-danger" @click="chooseAid(r.id, 'medical_advice')">{{ AID_ROUTE_LABELS.medical_advice }}</button>
+        </div>
+      </template>
+
+      <!-- 已选的出路说明 -->
+      <div v-if="r.aidChosen" class="banner banner-info" style="margin-top: 8px">
+        已选择「{{ AID_ROUTE_LABELS[r.aidChosen] }}」：{{ AID_ROUTE_HINTS[r.aidChosen] }}
+        <div v-if="r.aidNeighborName" class="muted">承接点：{{ r.aidNeighborName }}</div>
+        <div v-if="r.aidAlternative" class="muted">{{ r.aidAlternative }}</div>
+      </div>
+
+      <!-- 对分配有质疑（未收到答复前均可提交） -->
+      <div v-if="!answerOf(r.id)" class="inline-form" style="margin-top: 8px">
+        <input v-model="questionText[r.id]" type="text" placeholder="对分配结果有疑问？写给社区，会按逐项因子答复" />
+        <button class="btn btn-sm" @click="askQuestion(r.id)">提交质疑</button>
+      </div>
+      <div v-if="answerOf(r.id)" class="banner banner-success" style="margin-top: 8px">
+        社区答复：{{ answerOf(r.id)!.reply }}
+      </div>
+    </template>
 
     <div v-if="itemOf(r.itemId)" class="muted" style="margin: 6px 0">
       物品效期：<ExpiryBadge :expiry-date="itemOf(r.itemId)!.expiryDate" :now="store.nowIso" />

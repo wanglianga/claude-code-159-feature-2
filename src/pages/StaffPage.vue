@@ -3,24 +3,32 @@ import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useMedkitStore } from '@/stores/medkit'
 import { useFlash } from '@/composables/useFlash'
-import { CATEGORY_ICONS, CATEGORY_LABELS, FEEDBACK_TYPE_LABELS, ITEM_STATUS_LABELS } from '@/rules'
+import { AID_ROUTE_LABELS, CATEGORY_ICONS, CATEGORY_LABELS, FEEDBACK_TYPE_LABELS, ITEM_STATUS_LABELS, URGENCY_LABELS } from '@/rules'
 import SafetyBanner from '@/components/SafetyBanner.vue'
 import ExpiryBadge from '@/components/ExpiryBadge.vue'
 import ItemStatusBadge from '@/components/ItemStatusBadge.vue'
 import TimelineView from '@/components/TimelineView.vue'
+import AllocationPanel from '@/components/AllocationPanel.vue'
 
 const store = useMedkitStore()
 const router = useRouter()
 const { show } = useFlash()
-const tab = ref<'risk' | 'expiry' | 'review2' | 'trace'>('risk')
+const tab = ref<'risk' | 'expiry' | 'review2' | 'allocation' | 'shortage' | 'trace'>('risk')
 const traceId = ref('')
+const replyText = ref<Record<string, string>>({})
 
 const stats = computed(() => store.stats)
 const secondReviewQueue = computed(() => store.items.filter((i) => i.status === 'pending_review' && i.category === 'other_consumable' && i.review?.approved))
 const quarantined = computed(() => store.items.filter((i) => i.status === 'quarantined'))
+const allocationRounds = computed(() => store.allocations)
+const requestsById = computed(() => new Map(store.requests.map((r) => [r.id, r])))
+const shortage = computed(() => store.shortageReview)
 
 function feedbackItem(itemId: string) {
   return store.items.find((i) => i.id === itemId)
+}
+function reqOf(id: string) {
+  return requestsById.value.get(id)
 }
 
 function scrapFeedback(fid: string) {
@@ -49,6 +57,16 @@ function reject2(id: string) {
   const r = store.secondReview(id, false, reason || '复核不通过')
   show(r.message, r.ok ? 'ok' : 'err')
 }
+function replyQuestion(qid: string) {
+  const reply = replyText.value[qid]?.trim()
+  if (!reply) {
+    show('请填写答复内容（建议引用该户各项评分因子说明顺序）。', 'err')
+    return
+  }
+  const r = store.replyQuestion(qid, reply)
+  show(r.message, r.ok ? 'ok' : 'err')
+  if (r.ok) replyText.value[qid] = ''
+}
 </script>
 
 <template>
@@ -68,11 +86,15 @@ function reject2(id: string) {
       <div class="stat-card"><div class="num">{{ stats.waiting }}</div><div class="lbl">候补中</div></div>
       <div class="stat-card"><div class="num">{{ stats.activeCount }}</div><div class="lbl">在架物品</div></div>
       <div class="stat-card"><div class="num">{{ stats.scrapped }}</div><div class="lbl">累计报废</div></div>
+      <div class="stat-card"><div class="num" :style="{ color: 'var(--c-warn)' }">{{ stats.openHelp }}</div><div class="lbl">夜间求助待补发</div></div>
+      <div class="stat-card"><div class="num" :style="{ color: 'var(--c-danger)' }">{{ stats.openQuestions }}</div><div class="lbl">分配质疑待答复</div></div>
     </div>
     <div class="tabs" style="margin-top: 14px; margin-bottom: 0">
       <button class="chip" :class="{ active: tab === 'risk' }" @click="tab = 'risk'">风险反馈与隔离（{{ stats.openFeedback + stats.quarantined }}）</button>
       <button class="chip" :class="{ active: tab === 'expiry' }" @click="tab = 'expiry'">效期与报废</button>
       <button class="chip" :class="{ active: tab === 'review2' }" @click="tab = 'review2'">复核（{{ secondReviewQueue.length }}）</button>
+      <button class="chip" :class="{ active: tab === 'allocation' }" @click="tab = 'allocation'">分配理由与质疑（{{ stats.openQuestions }}）</button>
+      <button class="chip" :class="{ active: tab === 'shortage' }" @click="tab = 'shortage'">夜间短缺复盘</button>
       <button class="chip" :class="{ active: tab === 'trace' }" @click="tab = 'trace'">全链路追溯</button>
     </div>
   </div>
@@ -163,8 +185,98 @@ function reject2(id: string) {
     </div>
   </template>
 
+  <!-- 分配理由与质疑 -->
+  <template v-else-if="tab === 'allocation'">
+    <div v-if="!allocationRounds.length" class="card empty">还没有夜间多人分配记录。</div>
+
+    <div v-for="a in allocationRounds" :key="a.id" class="card" style="border-left: 4px solid var(--c-info)">
+      <div style="display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap">
+        <strong>🌙 夜间分配：{{ feedbackItem(a.itemId)?.name ?? a.itemId }}</strong>
+        <span class="badge badge-blue">{{ a.status === 'adopted' ? '已执行' : '仅建议' }} · {{ a.ruleVersion }}</span>
+      </div>
+
+      <AllocationPanel
+        mode="round"
+        :item-name="feedbackItem(a.itemId)?.name ?? a.itemId"
+        :available-qty="a.availableQty"
+        :volunteer-capacity="a.volunteerCapacity"
+        :round="a"
+        :requests-by-id="requestsById"
+      />
+
+      <details class="reason-details" open>
+        <summary>分配理由全文（用于答复居民质疑）</summary>
+        <pre class="reason-text">{{ a.summary }}</pre>
+      </details>
+
+      <h4 class="section-title" style="font-size: 0.98rem">本户居民的质疑与答复</h4>
+      <template v-for="rid in a.unallocatedRequestIds" :key="`q-${rid}`">
+        <div v-for="q in store.questions.filter((x) => x.requestId === rid)" :key="q.id" class="question-block" :class="q.status === 'open' ? 'is-open' : ''">
+          <div>
+            <strong>{{ q.questionerName }}</strong>
+            <span class="muted">（{{ reqOf(rid)?.address }} · 评分 {{ reqOf(rid)?.score }} 分）</span>
+            <span class="badge" :class="q.status === 'open' ? 'badge-red' : 'badge-green'" style="margin-left: 6px">
+              {{ q.status === 'open' ? '待答复' : '已答复' }}
+            </span>
+          </div>
+          <div style="margin: 4px 0">问：{{ q.content }}</div>
+          <div v-if="q.status === 'replied'" class="banner banner-success" style="margin: 6px 0">
+            答（{{ q.replierName }} · {{ q.repliedAt?.replace('T', ' ').slice(0, 16) }}）：{{ q.reply }}
+          </div>
+          <template v-if="q.status === 'open'">
+            <textarea v-model="replyText[q.id]" placeholder="参照上方逐户评分因子解释，例如：该户紧急程度为儿童高热 50 分且距离仅 150 米，综合分高于 38.6℃ 的家庭，故优先；你已转入相邻小区互助，到货后仍会补发。"></textarea>
+            <div class="card-actions">
+              <button class="btn btn-primary btn-sm" @click="replyQuestion(q.id)">提交答复（居民可见）</button>
+              <button class="btn btn-sm" @click="router.push(`/items/${a.itemId}`)">打开物品时间线</button>
+            </div>
+          </template>
+        </div>
+      </template>
+      <div v-if="!store.questions.some((q) => q.allocationId === a.id)" class="muted">本轮暂无居民质疑。</div>
+    </div>
+  </template>
+
+  <!-- 夜间短缺复盘 -->
+  <template v-else-if="tab === 'shortage'">
+    <div class="card">
+      <h2 style="margin-bottom: 4px">夜间短缺复盘 · 真实需求</h2>
+      <div class="muted">
+        每一条未满足的求助记录都代表一户夜间的真实需求。按物品聚合：多少户未分到、多少户靠相邻小区/替代用品/就医提示过渡、
+        多少户最终由到货补发满足——据此决定下次夜间该在门岗预置多少库存、协调多少配送运力。
+      </div>
+    </div>
+
+    <div class="stat-cards">
+      <div v-for="g in shortage.byItem" :key="g.itemName" class="stat-card">
+        <div class="num" :style="{ color: 'var(--c-warn)' }">{{ g.open }}</div>
+        <div class="lbl">
+          {{ g.itemName }}：待补发 {{ g.open }} / 已补发 {{ g.fulfilled }} / 已关闭 {{ g.closed }}（共 {{ g.total }} 户未即时满足）
+        </div>
+      </div>
+    </div>
+    <div v-if="!shortage.rows.length" class="card empty">没有未满足的夜间求助记录。</div>
+
+    <div v-for="row in shortage.rows" :key="row.req.id" class="card">
+      <div style="display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap">
+        <strong>{{ row.item?.name ?? row.req.itemId }} · {{ row.req.applicantName }}</strong>
+        <span class="badge" :class="row.req.helpStatus === 'fulfilled' ? 'badge-green' : row.req.helpStatus === 'closed' ? 'badge-gray' : 'badge-amber'">
+          {{ { open: '待到货补发', fulfilled: '已补发满足', closed: '已转就医/关闭' }[row.req.helpStatus ?? 'open'] }}
+        </span>
+      </div>
+      <div class="muted" style="margin: 6px 0">
+        {{ URGENCY_LABELS[row.req.urgency ?? 'spare'] }}<template v-if="row.req.hasChild"> · 儿童{{ row.req.childAge ? ` ${row.req.childAge} 岁` : '' }}</template>
+        · {{ row.req.distanceMeters ?? '?' }} 米 · 申请 {{ row.req.quantity }} 盒
+      </div>
+      <div v-if="row.req.aidChosen" class="muted">夜间过渡出路：{{ AID_ROUTE_LABELS[row.req.aidChosen] }}</div>
+      <div v-if="row.req.fulfilledAt" class="banner banner-success" style="margin-top: 8px">
+        {{ row.req.fulfilledAt.replace('T', ' ').slice(0, 16) }} 由 {{ row.req.fulfilledBy }} 到货补发。{{ row.req.fulfilledNote }}
+      </div>
+      <div v-if="row.round" class="muted" style="margin-top: 6px">分配轮次 {{ row.round.ruleVersion }}：该户评分 {{ row.req.score }} 分，排第 {{ row.round.requestIds.indexOf(row.req.id) + 1 }} 位。</div>
+    </div>
+  </template>
+
   <!-- 全链路追溯 -->
-  <template v-else>
+  <template v-else-if="tab === 'trace'">
     <div class="card">
       <label class="field" style="margin-bottom: 8px">
         <span>选择一件物品，查看从登记到报废的完整链路</span>
@@ -182,3 +294,34 @@ function reject2(id: string) {
     </div>
   </template>
 </template>
+
+<style scoped>
+.reason-details {
+  margin-top: 10px;
+}
+.reason-details summary {
+  cursor: pointer;
+  color: var(--c-primary-dark);
+  font-size: 0.88rem;
+}
+.reason-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--c-gray-100);
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 0.82rem;
+  font-family: inherit;
+  margin: 8px 0 0;
+}
+.question-block {
+  border: 1px solid var(--c-gray-200);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 8px 0;
+  background: #fff;
+}
+.question-block.is-open {
+  border-left: 4px solid var(--c-danger);
+}
+</style>

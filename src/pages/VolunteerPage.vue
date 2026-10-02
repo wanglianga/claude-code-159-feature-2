@@ -4,12 +4,14 @@ import { useRouter } from 'vue-router'
 import { useMedkitStore } from '@/stores/medkit'
 import { useFlash } from '@/composables/useFlash'
 import {
+  AID_ROUTE_LABELS,
   CATEGORY_LABELS,
   DELIVERY_SLA_HOURS,
   METHOD_LABELS,
   PICKUP_WINDOW_HOURS,
   SCENE_LABELS,
   STORAGE_LABELS,
+  URGENCY_LABELS,
   validateDraft,
 } from '@/rules'
 import SafetyBanner from '@/components/SafetyBanner.vue'
@@ -19,8 +21,9 @@ import PhotoCapture from '@/components/PhotoCapture.vue'
 const store = useMedkitStore()
 const router = useRouter()
 const { show } = useFlash()
-const tab = ref<'review' | 'delivery' | 'exceptions' | 'waiting'>('review')
+const tab = ref<'review' | 'delivery' | 'exceptions' | 'waiting' | 'resupply'>('review')
 const photos = ref<Record<string, string>>({})
+const restockTargetId = ref('i13')
 
 const reviewQueue = computed(() => store.reviewQueue)
 const overdue = computed(() => store.overduePickups)
@@ -30,6 +33,13 @@ const waitingReqs = computed(() =>
     .filter((r) => r.status === 'waiting')
     .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1)),
 )
+/** 存在夜间争抢（同一物品 ≥2 户候补中）的物品 */
+const contentionItems = computed(() => {
+  const byItem = new Map<string, number>()
+  for (const r of waitingReqs.value) byItem.set(r.itemId, (byItem.get(r.itemId) ?? 0) + 1)
+  return [...byItem.entries()].filter(([, n]) => n >= 2).map(([id, n]) => ({ item: itemOf(id), count: n }))
+})
+const openHelp = computed(() => store.openHelpRequests)
 
 /** 当前志愿者需要配送的任务（工作人员也可在本页兜底处理） */
 const deliveryTasks = computed(() =>
@@ -72,6 +82,25 @@ function confirmWaiting(id: string) {
   const r = store.confirmRequest(id)
   show(r.message, r.ok ? 'ok' : 'err')
 }
+function executeAllocation(itemId: string) {
+  const r = store.executeAllocation(itemId)
+  show(r.message, r.ok ? 'ok' : 'err')
+}
+function restock(itemId: string) {
+  const qtyRaw = window.prompt('本次新到货数量（盒/包）：', '3')
+  if (qtyRaw === null) return
+  const qty = Number(qtyRaw)
+  if (!Number.isFinite(qty) || qty <= 0) {
+    show('请输入大于 0 的数量。', 'err')
+    return
+  }
+  const r = store.registerRestock(itemId, qty, '夜间短缺后社区协调补货')
+  show(r.message, r.ok ? 'ok' : 'err')
+}
+function fulfill(reqId: string) {
+  const r = store.fulfillResupply(reqId, undefined, '新到货后按夜间求助记录补发')
+  show(r.message, r.ok ? 'ok' : 'err')
+}
 </script>
 
 <template>
@@ -94,6 +123,9 @@ function confirmWaiting(id: string) {
       </button>
       <button class="chip" :class="{ active: tab === 'waiting' }" @click="tab = 'waiting'">
         候补协调（{{ waitingReqs.length }}）
+      </button>
+      <button class="chip" :class="{ active: tab === 'resupply' }" @click="tab = 'resupply'">
+        到货补发（{{ openHelp.length }}）
       </button>
     </div>
   </div>
@@ -178,7 +210,24 @@ function confirmWaiting(id: string) {
   </template>
 
   <!-- 候补协调 -->
-  <template v-else>
+  <template v-else-if="tab === 'waiting'">
+    <!-- 夜间多人同时申请同一物品：优先按分配规则处理 -->
+    <h3 class="section-title" v-if="contentionItems.length">🌙 夜间多人同时申请（按距离/紧急程度/儿童/库存/配送能力给建议）</h3>
+    <div v-for="c in contentionItems" :key="c.item.id" class="card" style="border-left: 4px solid var(--c-info)">
+      <div style="display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap">
+        <strong>{{ c.item.name }} · {{ c.item.spec }}</strong>
+        <span class="badge badge-blue">{{ c.count }} 户同时申请 · 可借 {{ store.availableQty(c.item.id) }} 盒 · 今晚可配送 {{ store.volunteerCapacity }} 单</span>
+      </div>
+      <div class="muted" style="margin: 6px 0">
+        多户家长同时争抢时不要手工拍板，请打开物品页查看系统<strong>逐项评分的分配建议</strong>并一键执行；未分到的居民自动保留求助记录。
+      </div>
+      <div class="card-actions">
+        <button class="btn btn-primary btn-sm" @click="executeAllocation(c.item.id)">按分配建议执行（评分高者优先锁定）</button>
+        <button class="btn btn-sm" @click="router.push(`/items/${c.item.id}`)">查看评分明细与队列</button>
+      </div>
+    </div>
+
+    <h3 class="section-title">全部候补申请</h3>
     <div v-if="!waitingReqs.length" class="card empty">没有候补中 的申请。</div>
     <div v-for="r in waitingReqs" :key="r.id" class="card">
       <div style="display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap">
@@ -189,11 +238,63 @@ function confirmWaiting(id: string) {
         申请人：{{ r.applicantName }} · 当前可借 {{ store.availableQty(r.itemId) }}/{{ itemOf(r.itemId).quantity }}
         · 候补 {{ store.waitingList(r.itemId).findIndex((w) => w.id === r.id) + 1 }} 号位
       </div>
+      <div class="muted" v-if="r.urgency">
+        分配因子：{{ URGENCY_LABELS[r.urgency ?? 'spare'] }}
+        <template v-if="r.hasChild"> · 儿童{{ r.childAge ? ` ${r.childAge} 岁` : '' }}<template v-if="r.temperature"> · {{ r.temperature }}℃</template></template>
+        · 距离 {{ r.distanceMeters ?? '?' }} 米 · {{ METHOD_LABELS[r.method] }}
+      </div>
       <div class="card-actions">
         <button class="btn btn-primary btn-sm" :disabled="store.availableQty(r.itemId) < r.quantity" @click="confirmWaiting(r.id)">
           {{ store.availableQty(r.itemId) >= r.quantity ? '余量已恢复，确认递补' : '余量不足，继续等待' }}
         </button>
         <button class="btn btn-sm" @click="router.push(`/items/${r.itemId}`)">查看物品与队列</button>
+      </div>
+    </div>
+  </template>
+
+  <!-- 到货补发：夜间未满足的求助记录 -->
+  <template v-else-if="tab === 'resupply'">
+    <div class="card">
+      <h2 style="margin-bottom: 4px">到货补发 · 夜间短缺的真实需求</h2>
+      <div class="muted">
+        未在夜间分配中拿到物品的居民，其申请不会消失而是转为<strong>求助记录</strong>。库存到货后登记补货，再按记录逐户补发；
+        社区可据此复盘夜间真正短缺了多少。
+      </div>
+    </div>
+
+    <h3 class="section-title">待补发求助记录（{{ openHelp.length }}）</h3>
+    <div v-if="!openHelp.length" class="card empty">没有挂起的求助记录，夜间需求都已满足 🎉</div>
+    <div v-for="r in openHelp" :key="r.id" class="card">
+      <div style="display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap">
+        <strong>{{ itemOf(r.itemId)?.name ?? r.itemId }} ×{{ r.quantity }}（{{ r.applicantName }}）</strong>
+        <span class="badge badge-amber">求助记录待补发</span>
+      </div>
+      <div class="muted" style="margin: 6px 0">
+        {{ r.address ?? '地址未填' }} · 距取用点 {{ r.distanceMeters ?? '?' }} 米 · {{ METHOD_LABELS[r.method] }}
+      </div>
+      <div v-if="r.urgency" class="muted">紧急程度：{{ URGENCY_LABELS[r.urgency ?? 'spare'] }}<template v-if="r.temperature"> · 实测 {{ r.temperature }}℃</template></div>
+      <div v-if="r.aidChosen" class="banner banner-info" style="margin-top: 8px">
+        夜间已先选择「{{ AID_ROUTE_LABELS[r.aidChosen] }}」过渡，到货后仍按本记录补发。
+      </div>
+      <div class="card-actions">
+        <button class="btn btn-primary btn-sm" :disabled="store.availableQty(r.itemId) < r.quantity" @click="fulfill(r.id)">
+          {{ store.availableQty(r.itemId) >= r.quantity ? `库存充足，锁定补发 ×${r.quantity}` : `余量不足（${store.availableQty(r.itemId)}/${r.quantity}），先登记到货` }}
+        </button>
+        <button class="btn btn-sm btn-warn" @click="restock(r.itemId)">登记该物品到货</button>
+        <button class="btn btn-sm" @click="router.push(`/items/${r.itemId}`)">查看物品</button>
+      </div>
+    </div>
+
+    <h3 class="section-title">各物品夜间到货登记</h3>
+    <div class="card">
+      <div class="muted" style="margin-bottom: 8px">对夜间发生过短缺的退热贴等品类，志愿者可主动登记新到货：</div>
+      <div class="inline-form">
+        <select v-model="restockTargetId" style="max-width: 360px">
+          <option v-for="it in store.items.filter((i) => ['fever_patch', 'mask', 'iodophor', 'gauze', 'bandage', 'thermometer_battery', 'other_consumable'].includes(i.category))" :key="it.id" :value="it.id">
+            {{ it.name }} · {{ it.spec }}（当前 {{ it.quantity }}，可借 {{ store.availableQty(it.id) }}）
+          </option>
+        </select>
+        <button class="btn btn-sm btn-primary" @click="restock(restockTargetId)">登记到货并通知挂起的求助</button>
       </div>
     </div>
   </template>
